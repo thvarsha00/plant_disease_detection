@@ -1,0 +1,3 @@
+*.crdownload
+__pycache__/
+*.pyc

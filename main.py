@@ -1,9 +1,14 @@
 import streamlit as st
 import tensorflow as tf
 import numpy as np
+import pandas as pd
 import cv2
 import tempfile
 import os
+import re
+import io
+import requests
+from datetime import datetime
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 
 from remedies import get_remedy
@@ -13,6 +18,18 @@ try:
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
+
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
+
+try:
+    import reportlab  # noqa: F401
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
 
 # ----------------------------------------------------------------------------
 # Page Configuration
@@ -265,6 +282,24 @@ LANGUAGE_OPTIONS = {
     "संताली (Santali)": "Santali",
     "মৈতৈলোন্ (Manipuri)": "Manipuri",
     "سنڌي (Sindhi)": "Sindhi",
+}
+
+
+# gTTS (Google Translate TTS) only has voices for a subset of the languages
+# above. Anything not listed here will show a "not available yet" message
+# instead of failing silently or crashing.
+TTS_LANGUAGE_CODES = {
+    "English": "en",
+    "Hindi": "hi",
+    "Telugu": "te",
+    "Tamil": "ta",
+    "Kannada": "kn",
+    "Malayalam": "ml",
+    "Marathi": "mr",
+    "Gujarati": "gu",
+    "Bengali": "bn",
+    "Urdu": "ur",
+    "Nepali": "ne",
 }
 
 
@@ -537,6 +572,239 @@ def get_recommendation(plant, condition, confidence, language, class_name):
 
 
 # ----------------------------------------------------------------------------
+# Shared helper — strip the rec-card HTML down to plain text for TTS and PDF
+# ----------------------------------------------------------------------------
+def html_to_plain_text(html):
+    """Converts the small HTML dialect used in rec cards (br/p/li/strong/span) to plain text."""
+    text = html.replace("<br>", "\n").replace("</li>", "\n").replace("</p>", "\n")
+    text = re.sub(r"<[^>]+>", "", text)
+    lines = [line.strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# Text-to-Speech
+#
+# Reuses the same "never fail silently" pattern as Gemini: this always
+# returns (audio_bytes, error_message), never raises, so the UI can show a
+# clear reason instead of crashing when the package or language isn't
+# supported.
+# ----------------------------------------------------------------------------
+def generate_speech_audio(rec_html, language):
+    if not GTTS_AVAILABLE:
+        return None, "The `gTTS` package isn't installed. Add `gTTS` to requirements.txt and redeploy."
+
+    lang_code = TTS_LANGUAGE_CODES.get(language)
+    if not lang_code:
+        supported = ", ".join(TTS_LANGUAGE_CODES.keys())
+        return None, f"Audio narration isn't available for {language} yet. Supported languages: {supported}."
+
+    plain_text = html_to_plain_text(rec_html).replace("\n", ". ")
+    plain_text = re.sub(r"\.\s*\.", ".", plain_text).strip()
+    if not plain_text:
+        return None, "No text available to narrate."
+
+    try:
+        tts = gTTS(text=plain_text, lang=lang_code)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return buf.read(), None
+    except Exception as e:
+        return None, f"Could not generate audio right now: {e}"
+
+
+# ----------------------------------------------------------------------------
+# Weather-linked disease risk
+#
+# Uses Open-Meteo (no API key required) for geocoding + forecast. The risk
+# heuristic below is deliberately simple and transparent: it leans on
+# humidity as the dominant signal, echoing the finding from an earlier
+# weather-modeling project that humidity_3pm was the strongest predictor
+# available — sustained high humidity plus rain is when fungal spores
+# germinate and spread fastest on leaf surfaces.
+# ----------------------------------------------------------------------------
+def geocode_location(place_name):
+    """Returns ({"lat", "lon", "label"}, None) or (None, error_message)."""
+    try:
+        resp = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": place_name, "count": 1},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results")
+        if not results:
+            return None, "No matching location found. Try a nearby town, district, or city name."
+        r = results[0]
+        label = r["name"]
+        if r.get("admin1"):
+            label += f", {r['admin1']}"
+        if r.get("country"):
+            label += f", {r['country']}"
+        return {"lat": r["latitude"], "lon": r["longitude"], "label": label}, None
+    except Exception as e:
+        return None, f"Could not look up that location right now: {e}"
+
+
+def fetch_weather_risk(lat, lon):
+    """Returns (weather_json, None) or (None, error_message)."""
+    try:
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,precipitation",
+                "hourly": "relative_humidity_2m,precipitation_probability",
+                "forecast_days": 2,
+                "timezone": "auto",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json(), None
+    except Exception as e:
+        return None, f"Could not fetch weather data right now: {e}"
+
+
+def assess_fungal_risk(weather_json):
+    """Turns a weather forecast into a Low/Medium/High disease-spread risk with plain-language advice."""
+    current = weather_json.get("current", {})
+    hourly = weather_json.get("hourly", {})
+    humidity_series = hourly.get("relative_humidity_2m", [])[:24]
+    precip_prob_series = hourly.get("precipitation_probability", [])[:24]
+
+    avg_humidity = (
+        sum(humidity_series) / len(humidity_series)
+        if humidity_series else current.get("relative_humidity_2m", 0)
+    )
+    max_precip_prob = max(precip_prob_series) if precip_prob_series else 0
+
+    if avg_humidity >= 80 and max_precip_prob >= 50:
+        level = "High"
+        message = (
+            "High humidity combined with a strong chance of rain over the next 24 hours "
+            "creates favorable conditions for fungal spores to germinate and spread. "
+            "Consider a preventive fungicide application, improve airflow between plants, "
+            "and avoid overhead watering right now."
+        )
+    elif avg_humidity >= 65 or max_precip_prob >= 30:
+        level = "Medium"
+        message = (
+            "Moderate humidity or a chance of rain in the next 24 hours means disease "
+            "pressure could rise. Keep monitoring the plant and avoid wetting the leaves "
+            "when watering."
+        )
+    else:
+        level = "Low"
+        message = (
+            "Current conditions are relatively dry, which is lower-risk for fungal spread. "
+            "Still worth regular monitoring."
+        )
+
+    return {
+        "level": level,
+        "avg_humidity": avg_humidity,
+        "max_precip_prob": max_precip_prob,
+        "current_temp": current.get("temperature_2m"),
+        "current_humidity": current.get("relative_humidity_2m"),
+        "message": message,
+    }
+
+
+# ----------------------------------------------------------------------------
+# PDF report
+# ----------------------------------------------------------------------------
+def build_pdf_report(plant, condition, confidence, recommendation_text, language,
+                      source_label, leaf_image_path, heatmap_image):
+    """Builds a shareable PDF combining the diagnosis, both images, and the recommendation text."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
+    )
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle("TitleGreen", parent=styles["Title"], textColor=colors.HexColor("#00522f"))
+    heading_style = ParagraphStyle("HeadingGreen", parent=styles["Heading2"], textColor=colors.HexColor("#009150"))
+    disclaimer_style = ParagraphStyle("Disclaimer", parent=styles["Italic"], textColor=colors.HexColor("#6b8f7a"))
+    body_style = styles["Normal"]
+
+    story = [
+        Paragraph("Plant Disease Diagnosis Report", title_style),
+        Paragraph(datetime.now().strftime("Generated on %d %B %Y, %H:%M"), body_style),
+        Spacer(1, 14),
+    ]
+
+    summary_rows = [
+        ["Plant", plant],
+        ["Condition", condition],
+        ["Confidence", f"{confidence * 100:.2f}%"],
+        ["Recommendation language", language],
+        ["Recommendation source", source_label],
+    ]
+    summary_table = Table(summary_rows, colWidths=[160, 320])
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eaf7ee")),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#12261a")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#a9dfba")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#a9dfba")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 16))
+
+    img_cells = []
+    captions = []
+    try:
+        img_cells.append(RLImage(leaf_image_path, width=2.4 * inch, height=2.4 * inch))
+        captions.append("Input leaf image")
+    except Exception:
+        pass
+    if heatmap_image is not None:
+        ok, encoded = cv2.imencode(".jpg", heatmap_image)
+        if ok:
+            img_cells.append(RLImage(io.BytesIO(encoded.tobytes()), width=2.4 * inch, height=2.4 * inch))
+            captions.append("Model attention map")
+
+    if img_cells:
+        col_width = 2.6 * inch
+        story.append(Table([img_cells], colWidths=[col_width] * len(img_cells)))
+        story.append(Table(
+            [[Paragraph(c, styles["Italic"]) for c in captions]],
+            colWidths=[col_width] * len(img_cells),
+        ))
+        story.append(Spacer(1, 16))
+
+    story.append(Paragraph(f"Treatment Recommendation ({language})", heading_style))
+    for line in recommendation_text.split("\n"):
+        if line.strip():
+            story.append(Paragraph(line.strip(), body_style))
+            story.append(Spacer(1, 4))
+
+    story.append(Spacer(1, 20))
+    story.append(Paragraph(
+        "This report is generated for informational purposes only. For professional "
+        "agricultural guidance, consult a certified expert.",
+        disclaimer_style,
+    ))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+# ----------------------------------------------------------------------------
 # Sidebar Navigation
 # ----------------------------------------------------------------------------
 st.sidebar.title(" Navigation")
@@ -689,91 +957,245 @@ elif app_mode == "Disease Recognition":
 
     # --- Tab 1: Upload ---
     with tab1:
-        upload_col, lang_col = st.columns([3, 1])
-        with upload_col:
-            test_image = st.file_uploader("Upload a leaf image", type=["jpg", "jpeg", "png"])
-        with lang_col:
-            selected_language_label = st.selectbox(
-                "Recommendation language",
-                list(LANGUAGE_OPTIONS.keys()),
+        batch_mode = st.checkbox(" Batch mode — screen multiple leaves at once", key="batch_mode_toggle")
+
+        if batch_mode:
+            # ----------------------------------------------------------------
+            # Batch mode: fast screening across many images. Only runs the
+            # classifier (no heatmap/recommendation/audio per image, since
+            # doing all of that for a whole batch would be slow) and gives
+            # a table + CSV export. Turn batch mode off to get the full
+            # single-image workup on anything that looks concerning.
+            # ----------------------------------------------------------------
+            batch_files = st.file_uploader(
+                "Upload multiple leaf images",
+                type=["jpg", "jpeg", "png"],
+                accept_multiple_files=True,
+                key="batch_uploader",
             )
-            selected_language = LANGUAGE_OPTIONS[selected_language_label]
 
-        if test_image is not None:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
-                tmp_file.write(test_image.getbuffer())
-                temp_file_path = tmp_file.name
+            if batch_files:
+                with st.spinner(f"Analyzing {len(batch_files)} images..."):
+                    rows = []
+                    for f in batch_files:
+                        tmp_path = None
+                        try:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                                tmp.write(f.getbuffer())
+                                tmp_path = tmp.name
+                            img = tf.keras.preprocessing.image.load_img(tmp_path, target_size=IMAGE_SIZE)
+                            idx, conf = model_prediction(model, img)
+                            cname = CLASS_NAMES[idx]
+                            p, c = format_class_name(cname)
+                            rows.append({
+                                "File": f.name,
+                                "Plant": p,
+                                "Condition": c,
+                                "Confidence (%)": round(float(conf) * 100, 2),
+                            })
+                        except Exception as e:
+                            rows.append({"File": f.name, "Plant": "Error", "Condition": str(e), "Confidence (%)": 0.0})
+                        finally:
+                            if tmp_path and os.path.exists(tmp_path):
+                                os.remove(tmp_path)
 
-            col1, col2 = st.columns([1, 1])
+                results_df = pd.DataFrame(rows)
+                st.markdown("#### Batch Results")
+                st.dataframe(results_df, width="stretch", hide_index=True)
 
-            with col1:
-                st.markdown("**Input Image**")
-                st.image(test_image, width="stretch")
+                csv_bytes = results_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇ Download results as CSV",
+                    data=csv_bytes,
+                    file_name="batch_diagnosis_results.csv",
+                    mime="text/csv",
+                )
+                st.caption(
+                    "For a full recommendation, attention map, audio narration, or PDF report "
+                    "on any single leaf, turn off batch mode and upload it individually."
+                )
+            else:
+                st.info("Upload two or more leaf images to screen them all at once.")
 
-            with st.spinner("Analyzing image..."):
-                image = tf.keras.preprocessing.image.load_img(temp_file_path, target_size=IMAGE_SIZE)
-                result_index, confidence = model_prediction(model, image)
-                class_name = CLASS_NAMES[result_index]
-                plant, condition = format_class_name(class_name)
+        else:
+            # ----------------------------------------------------------------
+            # Single-image mode: full workup — diagnosis, recommendation,
+            # audio narration, weather-linked risk, attention map, and a
+            # downloadable PDF report.
+            # ----------------------------------------------------------------
+            upload_col, lang_col = st.columns([3, 1])
+            with upload_col:
+                test_image = st.file_uploader("Upload a leaf image", type=["jpg", "jpeg", "png"])
+            with lang_col:
+                selected_language_label = st.selectbox(
+                    "Recommendation language",
+                    list(LANGUAGE_OPTIONS.keys()),
+                )
+                selected_language = LANGUAGE_OPTIONS[selected_language_label]
 
-            with col2:
-                st.markdown("**Prediction Result**")
+            if test_image is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
+                    tmp_file.write(test_image.getbuffer())
+                    temp_file_path = tmp_file.name
+
+                col1, col2 = st.columns([1, 1])
+
+                with col1:
+                    st.markdown("**Input Image**")
+                    st.image(test_image, width="stretch")
+
+                with st.spinner("Analyzing image..."):
+                    image = tf.keras.preprocessing.image.load_img(temp_file_path, target_size=IMAGE_SIZE)
+                    result_index, confidence = model_prediction(model, image)
+                    class_name = CLASS_NAMES[result_index]
+                    plant, condition = format_class_name(class_name)
+
+                with col2:
+                    st.markdown("**Prediction Result**")
+                    st.markdown(f"""
+                        <div class="result-card">
+                            <div class="result-label">Plant</div>
+                            <div class="result-value">{plant}</div>
+                            <div class="result-label" style="margin-top:14px;">Condition</div>
+                            <div class="result-value">{condition}</div>
+                            <div class="result-label" style="margin-top:14px;">Confidence</div>
+                            <div class="confidence-value">{confidence * 100:.2f}%</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+
+                with st.spinner("Preparing recommendation..."):
+                    rec_html, rec_source, rec_banner = get_recommendation(
+                        plant, condition, confidence, selected_language, class_name
+                    )
+
+                badge_class = "rec-badge-gemini" if rec_source == "gemini" else "rec-badge-fallback"
+                badge_label = "Gemini" if rec_source == "gemini" else "Built-in reference"
+
+                st.markdown(
+                    f"###  Treatment Recommendation "
+                    f"<span class='rec-badge {badge_class}'>{badge_label}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.caption("Actionable guidance based on the diagnosis above.")
+
+                if rec_banner:
+                    st.info(rec_banner)
+
                 st.markdown(f"""
-                    <div class="result-card">
-                        <div class="result-label">Plant</div>
-                        <div class="result-value">{plant}</div>
-                        <div class="result-label" style="margin-top:14px;">Condition</div>
-                        <div class="result-value">{condition}</div>
-                        <div class="result-label" style="margin-top:14px;">Confidence</div>
-                        <div class="confidence-value">{confidence * 100:.2f}%</div>
+                    <div class="rec-card">
+                        <div class="rec-title">Recommendation ({selected_language})</div>
+                        {rec_html}
                     </div>
                 """, unsafe_allow_html=True)
 
-            st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+                # --- Text-to-speech ---
+                st.markdown("####  Listen to this recommendation")
+                with st.spinner("Generating audio..."):
+                    audio_bytes, audio_error = generate_speech_audio(rec_html, selected_language)
+                if audio_bytes:
+                    st.audio(audio_bytes, format="audio/mp3")
+                else:
+                    st.caption(f" {audio_error}")
 
-            with st.spinner("Preparing recommendation..."):
-                rec_html, rec_source, rec_banner = get_recommendation(
-                    plant, condition, confidence, selected_language, class_name
+                st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+                st.markdown("### Model Attention Map")
+                st.caption("Highlighted regions indicate areas the model focused on to reach its prediction.")
+
+                superimposed_img = None
+                try:
+                    img_array = np.expand_dims(
+                        tf.keras.preprocessing.image.img_to_array(image), axis=0
+                    )
+                    heatmap = make_cam_heatmap(model, img_array, LAST_CONV_LAYER_NAME)
+                    superimposed_img = overlay_heatmap(temp_file_path, heatmap)
+                    st.image(superimposed_img, width="stretch", channels="BGR")
+                except ValueError:
+                    st.error(
+                        f"Could not generate the attention map. The layer '{LAST_CONV_LAYER_NAME}' "
+                        "may not match the current model architecture."
+                    )
+                except Exception as e:
+                    st.error(f"An unexpected error occurred while generating the attention map: {e}")
+
+                # --- Weather-linked disease risk ---
+                st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+                st.markdown("###  Local Weather Risk")
+                st.caption("See whether current conditions favor disease spread in your area.")
+
+                location_input = st.text_input(
+                    "Your location (city or town)",
+                    key="weather_location_input",
+                    placeholder="e.g. Tirupati, Andhra Pradesh",
                 )
 
-            badge_class = "rec-badge-gemini" if rec_source == "gemini" else "rec-badge-fallback"
-            badge_label = "Gemini" if rec_source == "gemini" else "Built-in reference"
+                if location_input:
+                    with st.spinner("Looking up location..."):
+                        location, geo_error = geocode_location(location_input)
 
-            st.markdown(
-                f"###  Treatment Recommendation "
-                f"<span class='rec-badge {badge_class}'>{badge_label}</span>",
-                unsafe_allow_html=True,
-            )
-            st.caption("Actionable guidance based on the diagnosis above.")
+                    if geo_error:
+                        st.warning(geo_error)
+                    else:
+                        with st.spinner("Checking forecast and assessing risk..."):
+                            weather_json, weather_error = fetch_weather_risk(location["lat"], location["lon"])
 
-            if rec_banner:
-                st.info(rec_banner)
+                        if weather_error:
+                            st.warning(weather_error)
+                        else:
+                            risk = assess_fungal_risk(weather_json)
+                            risk_class = {
+                                "High": "severity-High",
+                                "Medium": "severity-Medium",
+                                "Low": "severity-Low",
+                            }[risk["level"]]
 
-            st.markdown(f"""
-                <div class="rec-card">
-                    <div class="rec-title">Recommendation ({selected_language})</div>
-                    {rec_html}
-                </div>
-            """, unsafe_allow_html=True)
+                            st.markdown(f"""
+                                <div class="result-card">
+                                    <div class="result-label">Location</div>
+                                    <div class="result-value" style="font-size:18px;">{location['label']}</div>
+                                    <div class="result-label" style="margin-top:14px;">Disease Spread Risk</div>
+                                    <div class="{risk_class}" style="font-size:20px;">{risk['level']}</div>
+                                </div>
+                            """, unsafe_allow_html=True)
+                            st.caption(
+                                f"Current: {risk['current_temp']}°C, {risk['current_humidity']}% humidity · "
+                                f"Next 24h avg humidity: {risk['avg_humidity']:.0f}% · "
+                                f"Max rain chance: {risk['max_precip_prob']:.0f}%"
+                            )
+                            st.info(risk["message"])
 
-            st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
-            st.markdown("### Model Attention Map")
-            st.caption("Highlighted regions indicate areas the model focused on to reach its prediction.")
+                # --- Downloadable PDF report ---
+                st.markdown("<div class='section-divider'></div>", unsafe_allow_html=True)
+                st.markdown("###  Downloadable Report")
+                st.caption("Share this diagnosis with an agronomist or keep it for your records.")
 
-            try:
-                img_array = np.expand_dims(
-                    tf.keras.preprocessing.image.img_to_array(image), axis=0
-                )
-                heatmap = make_cam_heatmap(model, img_array, LAST_CONV_LAYER_NAME)
-                superimposed_img = overlay_heatmap(temp_file_path, heatmap)
-                st.image(superimposed_img, width="stretch", channels="BGR")
-            except ValueError:
-                st.error(
-                    f"Could not generate the attention map. The layer '{LAST_CONV_LAYER_NAME}' "
-                    "may not match the current model architecture."
-                )
-            except Exception as e:
-                st.error(f"An unexpected error occurred while generating the attention map: {e}")
+                if not REPORTLAB_AVAILABLE:
+                    st.caption(" PDF export isn't available yet — add `reportlab` to requirements.txt and redeploy.")
+                else:
+                    pdf_bytes = None
+                    with st.spinner("Preparing PDF report..."):
+                        try:
+                            pdf_bytes = build_pdf_report(
+                                plant=plant,
+                                condition=condition,
+                                confidence=confidence,
+                                recommendation_text=html_to_plain_text(rec_html),
+                                language=selected_language,
+                                source_label=badge_label,
+                                leaf_image_path=temp_file_path,
+                                heatmap_image=superimposed_img,
+                            )
+                        except Exception as e:
+                            st.error(f"Could not generate the PDF report: {e}")
+
+                    if pdf_bytes:
+                        st.download_button(
+                            "⬇ Download PDF report",
+                            data=pdf_bytes,
+                            file_name=f"plant_diagnosis_{plant.replace(' ', '_').lower()}.pdf",
+                            mime="application/pdf",
+                        )
 
     # --- Tab 2: Live Camera ---
     with tab2:

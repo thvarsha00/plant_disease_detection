@@ -4,3 +4,8 @@ numpy
 opencv-python-headless
 streamlit-webrtc
 google-genai
+gTTS
+reportlab
+requests
+pandas
+ 

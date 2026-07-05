@@ -31,9 +31,9 @@ try:
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
-# ----------------------------------------------------------------------------
+
 # Page Configuration
-# ----------------------------------------------------------------------------
+
 st.set_page_config(
     page_title="Plant Disease Recognition System",
     page_icon="",
@@ -41,16 +41,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ----------------------------------------------------------------------------
-# Custom Styling — Green / Plant-Care Theme
-#
-# NOTE: this CSS block styles content Streamlit lets us reach with markup.
-# It intentionally does NOT try to re-theme the header bar, toolbar, file
-# uploader chrome, or widget internals — those are rendered by Streamlit
-# itself using .streamlit/config.toml, which is the only reliable way to
-# theme them (inline CSS selectors for that chrome break on every Streamlit
-# version bump). Ship both files together.
-# ----------------------------------------------------------------------------
 st.markdown("""
     <style>
         /* ------------------------------------------------------------------
@@ -234,9 +224,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# ----------------------------------------------------------------------------
-# Constants
-# ----------------------------------------------------------------------------
 MODEL_PATH = "trained_model.h5"
 LAST_CONV_LAYER_NAME = "conv2d_9"
 IMAGE_SIZE = (128, 128)
@@ -285,9 +272,7 @@ LANGUAGE_OPTIONS = {
 }
 
 
-# gTTS (Google Translate TTS) only has voices for a subset of the languages
-# above. Anything not listed here will show a "not available yet" message
-# instead of failing silently or crashing.
+
 TTS_LANGUAGE_CODES = {
     "English": "en",
     "Hindi": "hi",
@@ -303,9 +288,9 @@ TTS_LANGUAGE_CODES = {
 }
 
 
-# ----------------------------------------------------------------------------
+
 # Model Loading
-# ----------------------------------------------------------------------------
+
 @st.cache_resource()
 def load_model():
     """Loads and caches the trained Keras model."""
@@ -1234,3 +1219,30 @@ elif app_mode == "Disease Recognition":
                 return output_img
 
         webrtc_streamer(key="live_cam_recognition", video_transformer_factory=VideoTransformer)
+
+
+# ----------------------------------------------------------------------------
+# Floating Chatbot Widget Injection
+# ----------------------------------------------------------------------------
+import streamlit.components.v1 as components
+
+# We use the connection token for the plant disease RAG knowledge base.
+widget_html = """
+<script>
+  const parentDoc = window.parent.document;
+  if (!parentDoc.getElementById('anshubot-script-loaded')) {
+    // Set global config variables in parent window
+    window.parent.ANSHUBOT_TOKEN = 'd3ceb389-4aa1-4c0f-ad12-2ea2fcedf972';
+    window.parent.ANSHUBOT_BASE_URL = 'http://89.116.121.52:8090/';
+    window.parent.ANSHUBOT_BOT_NAME = 'KrishiSetu AI';
+    
+    // Create script tag and load the floating widget
+    const script = parentDoc.createElement('script');
+    script.id = 'anshubot-script-loaded';
+    script.src = 'http://89.116.121.52:8090/widget/anshubot-widget.js';
+    parentDoc.body.appendChild(script);
+    console.log("KrishiSetu AI Chatbot widget successfully injected into parent DOM.");
+  }
+</script>
+"""
+components.html(widget_html, height=0, width=0)

@@ -3,7 +3,6 @@ tensorflow-cpu==2.15.0
 numpy
 opencv-python-headless
 streamlit-webrtc
-google-genai
 gTTS
 reportlab
 requests

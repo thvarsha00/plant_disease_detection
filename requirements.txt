@@ -7,5 +7,5 @@ gTTS
 reportlab
 requests
 pandas
- 
+google-genai
  
